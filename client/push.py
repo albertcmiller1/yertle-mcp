@@ -74,9 +74,6 @@ def _merge_state(current_raw: dict, incoming: dict) -> dict:
     node = current_raw.get("node", {})
 
     # Build push-compatible base from complete response
-    # Note: complete response nests tags/directories under "node",
-    # but the push API expects them as top-level state keys
-    #
     base_vps = [dict(vp) for vp in current_raw.get("visual_properties", [])]
 
     base = {
@@ -84,10 +81,10 @@ def _merge_state(current_raw: dict, incoming: dict) -> dict:
             "title": node.get("title", ""),
             "description": node.get("description", ""),
         },
-        "tags": node.get("tags", {}),
-        "directories": node.get("directories", []),
+        "tags": current_raw.get("tags", {}),
+        "directories": current_raw.get("directories", []),
         "visual_properties": base_vps,
-        "connections": current_raw.get("child_node_connections", []),
+        "connections": current_raw.get("connections", []),
     }
 
     # Overlay incoming sections onto the base.

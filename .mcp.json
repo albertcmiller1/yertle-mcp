@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "yertle": {
+      "command": "pipenv",
+      "args": ["run", "python", "server.py"],
+      "cwd": "/Users/almiller/Applications/yertle-repos/yertle-mcp",
+      "env": {
+        "FLOW_API_URL": "http://localhost:8000",
+        "FLOW_USER_EMAIL": "albertcmiller1@gmail.com",
+        "FLOW_USER_PASSWORD": "yertle123",
+        "FLOW_DEFAULT_ORG_ID": ""
+      }
+    }
+  }
+}
