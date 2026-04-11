@@ -48,7 +48,7 @@ def transform_complete_state(raw: dict) -> dict:
 
     # 3. Resolve connection UUIDs to names
     connections = []
-    for conn in raw.get("child_node_connections", []):
+    for conn in raw.get("connections", []):
         from_id = conn.get("from_child_id", "")
         to_id = conn.get("to_child_id", "")
         connections.append({
@@ -70,7 +70,7 @@ def transform_complete_state(raw: dict) -> dict:
             "title": node.get("title", ""),
             "description": node.get("description", ""),
             "id": node.get("id", ""),
-            "tags": node.get("tags", {}),
+            "tags": raw.get("tags", {}),
         },
         "components": components,
         "connections": connections,
