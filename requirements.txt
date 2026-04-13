@@ -1,0 +1,4 @@
+mcp
+httpx
+mangum
+python-jose[cryptography]

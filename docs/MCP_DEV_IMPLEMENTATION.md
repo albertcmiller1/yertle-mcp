@@ -1,412 +1,332 @@
 # MCP Server — Dev/Prod Deployment Implementation
 
-> This document captures the implementation plan for deploying the yertle MCP server to our AWS dev and prod environments. It supersedes the outdated parts of `MCP_DEPLOYMENT.md` — that doc remains as historical reference.
+> This document captures the complete implementation for deploying the yertle MCP server to AWS. It reflects the working code as of April 2026.
 
 ## Overview
 
-The MCP server currently runs locally via stdio with hardcoded email/password credentials. We need to deploy it as a remote MCP server accessible over HTTPS, with proper OAuth 2.1 authentication, integrated into our existing deployment pipeline.
+The MCP server runs as an AWS Lambda function behind the existing API Gateway, accessible over HTTPS. Users authenticate via OAuth 2.1 (authorization code flow with PKCE) through Cognito's hosted UI. The server uses FastMCP in stateless HTTP mode, wrapped by Mangum for Lambda compatibility.
+
+**Deployed and tested on:** claude.ai, Claude Desktop, Claude Code
 
 ## Key Decisions
 
 | Decision | Choice | Why |
 |----------|--------|-----|
-| Auth method | OAuth 2.1 + PKCE (authorization code flow) | MCP spec standard; natively supported by Claude Desktop and claude.ai |
-| OAuth client naming | Generic `OAuth*` (not `MCP*`) | Same Cognito OAuth client will be reused by yertle-cli browser login (future) |
+| Auth method | OAuth 2.1 + PKCE (authorization code flow) | MCP spec standard; natively supported by Claude clients |
+| OAuth client naming | Generic `OAuth*` (not `MCP*`) | Same Cognito client reused by CLI browser login (future) |
 | Cognito domain | Custom domain (`auth.albertcmiller.com` / `auth.yertle.com`) | Professional, branded login experience |
-| API Gateway | Add routes to existing backend API Gateway | Reuses existing infrastructure; avoids managing a separate gateway |
-| Deployment | Bundle into existing `yertle/deployment/` pipeline | Pipeline is battle-tested; cross-stack dependencies are already wired |
+| API Gateway | Routes on existing backend API Gateway | Reuses infrastructure; avoids managing a separate gateway |
+| Deployment | Bundled into existing `yertle/deployment/` pipeline | Pipeline is battle-tested; cross-stack dependencies already wired |
 | User identity | Pass through user's OAuth token to Flow API | Each MCP user acts as themselves, not a shared service account |
-
-## What Changed vs. MCP_DEPLOYMENT.md
-
-| Original proposal | Current plan |
-|-------------------|--------------|
-| Separate API Gateway + `mcp.yertle.com` domain | Routes on existing API Gateway (`api-{slot}-{env}.{domain}`) |
-| Standalone CloudFormation stack | Integrated into existing pipeline steps |
-| MCP server authenticates with its own credentials | User's OAuth token passed through to Flow API |
-| Cognito prefix domain for hosted UI | Custom domain (`auth.{domain}`) |
+| DCR strategy | Return pre-registered `OAuthUserPoolClient` ID | Ensures token audience matches Flow API Gateway; no dynamic client creation |
+| Lambda mode | Stateless HTTP, fresh session manager per invocation | Required because Mangum triggers ASGI lifespan per-invocation |
 
 ## Architecture
 
 ```
-Claude Desktop / claude.ai
+Claude Desktop / claude.ai / Claude Code
         │
-        │  HTTPS (POST /mcp, GET /.well-known/*)
+        │  1. POST /mcp → 401 + WWW-Authenticate (resource_metadata URL)
+        │  2. GET /.well-known/oauth-protected-resource → our server as auth server
+        │  3. GET /.well-known/oauth-authorization-server → Cognito endpoints + DCR
+        │  4. POST /register → returns pre-registered OAuthUserPoolClient ID
+        │  5. Browser → auth.albertcmiller.com (Cognito hosted UI) → user logs in
+        │  6. Cognito redirects to callback with auth code
+        │  7. Client exchanges code for tokens (PKCE, directly with Cognito)
+        │  8. POST /mcp + Bearer token → MCP tool calls work
         ▼
-┌─────────────────────────────────────────────────┐
-│  API Gateway (existing: flow-api-{env})         │
-│                                                 │
-│  Existing routes ──► Backend Lambda             │
-│    GET /health (no auth)                        │
-│    POST /auth/signin (no auth)                  │
-│    POST /auth/refresh (no auth)                 │
-│    ANY /{proxy+} (Cognito JWT authorizer)       │
-│                                                 │
-│  New MCP routes ──► MCP Lambda (NEW)            │
-│    POST /mcp (OAuth JWT authorizer)              │
-│    GET /mcp (OAuth JWT authorizer)               │
-│    GET /.well-known/oauth-protected-resource    │
-│         (no auth)                               │
-└─────────────────────────────────────────────────┘
-        │                            │
-        ▼                            ▼
-  Backend Lambda              MCP Lambda (NEW)
-  (existing)                  ┌──────────────┐
-                              │ Mangum       │
-                              │ FastMCP      │
-                              │ auth.py      │
-                              └──────┬───────┘
-                                     │ HTTP (user's Bearer token)
-                                     ▼
-                              Backend API (same gateway)
+┌─────────────────────────────────────────────────────────┐
+│  API Gateway (existing: flow-api-{env})                 │
+│                                                         │
+│  Existing backend routes ──► Backend Lambda             │
+│    GET /health (no auth)                                │
+│    POST /auth/signin (no auth)                          │
+│    POST /auth/refresh (no auth)                         │
+│    ANY /{proxy+} (CognitoAuthorizer — accepts both      │
+│                   frontend + OAuth client audiences)     │
+│                                                         │
+│  MCP routes ──► MCP Lambda                              │
+│    POST /mcp (no API Gateway auth — Lambda handles it)  │
+│    GET /mcp (no API Gateway auth — Lambda handles it)   │
+│    GET /.well-known/oauth-protected-resource (no auth)  │
+│    GET /.well-known/oauth-authorization-server (no auth)│
+│    POST /register (no auth)                             │
+└─────────────────────────────────────────────────────────┘
+        │                              │
+        ▼                              ▼
+  Backend Lambda                 MCP Lambda
+  (existing)                     ┌────────────────────┐
+                                 │ TokenPassthrough    │
+                                 │   Middleware:       │
+                                 │  - OAuth metadata   │
+                                 │  - Auth server meta │
+                                 │  - DCR (returns     │
+                                 │    pre-reg client)  │
+                                 │  - Token validation │
+                                 │  - Token passthrough│
+                                 │  - 401 + WWW-Auth   │
+                                 │                     │
+                                 │ FastMCP (stateless) │
+                                 │  - 8 Tools          │
+                                 │  - 4 Resources      │
+                                 └─────────┬───────────┘
+                                           │ HTTP with user's
+                                           │ Bearer token
+                                           ▼
+                                     Backend API
+                                   (same gateway,
+                                    CognitoAuthorizer
+                                    accepts OAuth
+                                    client audience)
 ```
 
-## OAuth 2.1 Flow
+## How Authentication Works (Full Detail)
 
-1. Claude client sends unauthenticated `POST /mcp` to API Gateway
-2. API Gateway returns `401` (JWT authorizer rejects — no token)
-3. Claude fetches `GET /.well-known/oauth-protected-resource` from same gateway
-4. Response identifies Cognito as authorization server:
-   ```json
-   {
-     "resource": "https://api-blue-dev.albertcmiller.com/mcp",
-     "authorization_servers": ["https://auth.albertcmiller.com"]
-   }
-   ```
-5. Claude discovers Cognito's OAuth endpoints via `/.well-known/openid-configuration`
-6. Claude opens browser → user logs in via Cognito hosted UI
-7. Cognito redirects to `https://claude.ai/api/mcp/auth_callback` with auth code
-8. Claude exchanges code for tokens (PKCE S256 verification)
-9. Subsequent `POST /mcp` requests include `Authorization: Bearer <access_token>`
-10. API Gateway validates JWT via OAuth authorizer → routes to MCP Lambda
+This section explains the complete auth flow, including the problems we encountered and how they were solved. Understanding this is critical for debugging.
 
-## Implementation Steps
+### The MCP OAuth Requirement
 
-### Step 1: Cognito OAuth Resources
+The MCP spec requires remote servers to support:
+1. **Protected Resource Metadata** (`/.well-known/oauth-protected-resource`) — RFC 9728
+2. **Authorization Server Metadata** (`/.well-known/oauth-authorization-server`) — RFC 8414
+3. **Dynamic Client Registration** (`POST /register`) — RFC 7591
+4. **OAuth 2.1 authorization code flow with PKCE**
 
-**File: `yertle/deployment/infrastructure/shared/cognito.yml`**
+AWS Cognito does NOT natively support items 2 and 3. Our MCP Lambda serves these endpoints itself, acting as an OAuth adapter layer in front of Cognito.
 
-Add to existing template (no changes to existing resources):
+### The DCR Problem and Solution
+
+**Problem:** The MCP spec says clients must register via DCR before starting the OAuth flow. The naive approach was to call `cognito-idp:CreateUserPoolClient` for each registration, creating a unique Cognito app client per MCP client. This produced tokens with different `client_id` claims. The Flow backend API Gateway's JWT authorizer has an `Audience` list that checks the token's `client_id` — it rejected tokens from dynamically created clients because their `client_id` wasn't in the list.
+
+**Solution:** The DCR endpoint (`POST /register`) returns the **pre-registered `OAuthUserPoolClient` ID** for all registrants instead of creating new clients. This means:
+- All MCP clients get the same `client_id`
+- All tokens have `client_id` matching the `OAuthUserPoolClient`
+- The Flow API Gateway's `CognitoAuthorizer` accepts them (audience list includes both the original frontend client AND the OAuth client)
+- Each user still authenticates as themselves via Cognito — they share one app client but have individual user identities
+
+### The Token Pass-Through Flow
+
+```
+1. claude.ai sends POST /mcp with Authorization: Bearer <token>
+2. TokenPassthroughMiddleware intercepts:
+   a. Extracts Bearer token from Authorization header
+   b. Validates JWT signature (RS256 via Cognito JWKS)
+   c. Validates issuer (must match our Cognito User Pool)
+   d. Skips audience check (not needed — issuer is sufficient)
+   e. Calls client.set_user_token(token) on the shared FlowClient
+   f. If validation fails → returns 401 with WWW-Authenticate header
+3. FastMCP handles the MCP request, invokes the tool
+4. Tool calls FlowClient method (e.g., list_organizations)
+5. FlowClient sends HTTP request to Flow backend API with the user's token
+6. Flow API Gateway validates the token:
+   - Checks issuer (Cognito User Pool) ✓
+   - Checks audience (client_id in token matches OAuthUserPoolClient) ✓
+7. Flow backend processes the request as the authenticated user
+8. Response flows back through FlowClient → tool → FastMCP → Mangum → API Gateway → client
+```
+
+### Why Auth Validation Skips Audience
+
+Cognito access tokens contain a `client_id` claim (not `aud`). API Gateway v2's JWT authorizer checks `client_id` against its `Audience` list. But our MCP Lambda's own token validation (`auth.py`) runs BEFORE the token reaches the Flow API Gateway. We validate issuer + signature but skip `aud`/`client_id` because:
+- The issuer check proves the token came from our Cognito pool
+- The `client_id` check happens downstream at the Flow API Gateway
+- Checking audience in our middleware would require knowing all valid client IDs
+
+### The Backend API Gateway Audience Fix
+
+The Flow backend API Gateway's `CognitoAuthorizer` originally only accepted tokens from the frontend app client (`CognitoUserPoolClientId`). We added the `OAuthUserPoolClientId` to its `Audience` list so it accepts tokens from MCP clients too:
 
 ```yaml
-# Cognito custom domain for hosted UI (OAuth endpoints)
-UserPoolDomain:
-  Type: AWS::Cognito::UserPoolDomain
-  Properties:
-    Domain: !Sub 'auth.${Domain}'
-    UserPoolId: !Ref UserPool
-    CustomDomainConfig:
-      CertificateArn: !Ref AcmCertificateArn
-
-# Route53 record for Cognito custom domain
-UserPoolDomainDNS:
-  Type: AWS::Route53::RecordSet
-  Properties:
-    HostedZoneId: !Ref HostedZoneId
-    Name: !Sub 'auth.${Domain}'
-    Type: A
-    AliasTarget:
-      DNSName: !GetAtt UserPoolDomain.CloudFrontDistribution
-      HostedZoneId: Z2FDTNDATAQYW2  # CloudFront global hosted zone ID
-
-# Shared OAuth app client (used by MCP server, CLI browser login, and future OAuth clients)
-OAuthUserPoolClient:
-  Type: AWS::Cognito::UserPoolClient
-  Properties:
-    UserPoolId: !Ref UserPool
-    ClientName: !Sub '${StackName}-oauth-client'
-    GenerateSecret: false
-    AllowedOAuthFlows:
-      - code
-    AllowedOAuthFlowsUserPoolClient: true
-    AllowedOAuthScopes:
-      - openid
-      - profile
-      - email
-    CallbackURLs:
-      - 'https://claude.ai/api/mcp/auth_callback'
-      - 'http://localhost:9876/callback'  # yertle-cli browser login (future)
-    LogoutURLs:
-      - 'https://claude.ai'
-    SupportedIdentityProviders:
-      - COGNITO
-    ExplicitAuthFlows:
-      - ALLOW_REFRESH_TOKEN_AUTH
-    TokenValidityUnits:
-      AccessToken: hours
-      IdToken: hours
-      RefreshToken: days
-    AccessTokenValidity: 24
-    IdTokenValidity: 24
-    RefreshTokenValidity: 30
-    PreventUserExistenceErrors: ENABLED
+# In api-core.yml
+CognitoAuthorizer:
+  JwtConfiguration:
+    Audience:
+      - !Ref CognitoUserPoolClientId      # frontend/CLI
+      - !Ref OAuthUserPoolClientId         # MCP clients
 ```
 
-New parameters to add: `Domain`, `AcmCertificateArn`, `HostedZoneId`.
+## Lambda Lifecycle (Critical for Debugging)
 
-New outputs: `OAuthUserPoolClientId`, `UserPoolDomainName`.
+Running FastMCP inside Lambda required solving several lifecycle issues:
 
-**Note:** The ACM certificate for `auth.albertcmiller.com` must be in **us-east-1** (Cognito custom domains use CloudFront under the hood). The existing cert (`a08108a5-...`) covers `albertcmiller.com` — check if it's a wildcard (`*.albertcmiller.com`) or if a new cert is needed for `auth.albertcmiller.com`.
+### Problem 1: Session Manager Can Only Start Once
 
-### Step 2: MCP Lambda Function
+FastMCP's `StreamableHTTPSessionManager.run()` creates an async task group and can only be called once per instance. But Mangum triggers the ASGI lifespan on every invocation.
 
-**File: `yertle/deployment/infrastructure/backend/mcp-lambda.yml`** (new)
+**Solution:** In `lambda_handler.py`, reset `server._session_manager = None` before each invocation so `streamable_http_app()` creates a fresh one:
 
-CloudFormation template for the MCP Lambda:
-- Function name: `{env}-yertle-mcp-{slot}`
-- Runtime: Python 3.13
-- Memory: 256 MB
-- Timeout: 30 seconds
-- Handler: `lambda_handler.handler`
-- Code: `s3://{env}-yertle-deployments/lambda/{slot}/{version}/mcp.zip`
-- Environment variables:
-  - `FLOW_API_URL` — `https://api-{slot}-{env}.{domain}` (public URL of backend)
-  - `COGNITO_REGION` — `us-east-1`
-  - `COGNITO_USER_POOL_ID` — from Cognito stack output
-  - `COGNITO_APP_CLIENT_ID` — OAuth client ID from Cognito stack output
-- IAM: CloudWatch Logs only (no direct AWS service access needed — MCP proxies to Flow API over HTTP)
-
-### Step 3: API Gateway Routes
-
-**File: `yertle/deployment/infrastructure/backend/api-core.yml`** (modify)
-
-Add to the existing template:
-
-**New parameters:**
-- `MCPLambdaArn` — ARN of the MCP Lambda function
-- `OAuthUserPoolClientId` — OAuth app client ID (different audience from backend)
-
-**New resources:**
-
-```yaml
-# Separate Lambda integration for MCP
-MCPLambdaIntegration:
-  Type: AWS::ApiGatewayV2::Integration
-  Properties:
-    ApiId: !Ref HttpApi
-    IntegrationType: AWS_PROXY
-    IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MCPLambdaArn}/invocations'
-    PayloadFormatVersion: '2.0'
-
-# JWT authorizer for OAuth clients (MCP server, CLI browser login, future OAuth clients)
-# Separate from the existing CognitoAuthorizer which validates against the frontend app client
-OAuthCognitoAuthorizer:
-  Type: AWS::ApiGatewayV2::Authorizer
-  Properties:
-    ApiId: !Ref HttpApi
-    AuthorizerType: JWT
-    Name: OAuthCognitoJWTAuthorizer
-    IdentitySource:
-      - $request.header.Authorization
-    JwtConfiguration:
-      Issuer: !Sub
-        - 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}'
-        - UserPoolId: !Select [1, !Split ['/', !Select [5, !Split [':', !Ref CognitoUserPoolArn]]]]
-      Audience:
-        - !Ref OAuthUserPoolClientId
-
-# MCP route (authenticated via OAuth authorizer)
-MCPRoute:
-  Type: AWS::ApiGatewayV2::Route
-  Properties:
-    ApiId: !Ref HttpApi
-    RouteKey: 'POST /mcp'
-    AuthorizationType: JWT
-    AuthorizerId: !Ref OAuthCognitoAuthorizer
-    Target: !Sub 'integrations/${MCPLambdaIntegration}'
-
-# MCP SSE route (if needed)
-MCPGetRoute:
-  Type: AWS::ApiGatewayV2::Route
-  Properties:
-    ApiId: !Ref HttpApi
-    RouteKey: 'GET /mcp'
-    AuthorizationType: JWT
-    AuthorizerId: !Ref OAuthCognitoAuthorizer
-    Target: !Sub 'integrations/${MCPLambdaIntegration}'
-
-# OAuth metadata discovery (no auth)
-OAuthMetadataRoute:
-  Type: AWS::ApiGatewayV2::Route
-  Properties:
-    ApiId: !Ref HttpApi
-    RouteKey: 'GET /.well-known/oauth-protected-resource'
-    AuthorizationType: NONE
-    Target: !Sub 'integrations/${MCPLambdaIntegration}'
-
-# Lambda permission for MCP function
-MCPLambdaApiPermission:
-  Type: AWS::Lambda::Permission
-  Properties:
-    Action: lambda:InvokeFunction
-    FunctionName: !Ref MCPLambdaArn
-    Principal: apigateway.amazonaws.com
-    SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*'
-```
-
-**Important:** The `GET /.well-known/oauth-protected-resource` route must be defined as a specific route (not caught by `ANY /{proxy+}`) so it reaches the MCP Lambda without auth. API Gateway v2 matches more-specific routes first, so this should work.
-
-### Step 4: MCP Server Code Changes
-
-#### `yertle-mcp/lambda_handler.py` (new)
-
-Mangum wrapper to run FastMCP's ASGI app inside Lambda:
 ```python
-from mangum import Mangum
-from app import server
-import tools
-import resources
-
-handler = Mangum(server.asgi_app())
+def handler(event, context):
+    server._session_manager = None
+    app = server.streamable_http_app()
+    ...
 ```
 
-#### `yertle-mcp/auth.py` (new)
+### Problem 2: Lifespan Creates Duplicate FlowClient
 
-- Cognito JWT validation (RS256 via JWKS)
-- Cache JWKS keys in module-level variable (survives across warm Lambda invocations)
-- Extract `sub` (user ID) and `email` from validated token
-- Serve `/.well-known/oauth-protected-resource` response
+The `lifespan()` function in `app.py` creates a new `Config` and `FlowClient`, storing them on `server._flow_client`. But `_init_lambda()` already creates these on cold start. When the lifespan runs (triggered by Mangum), it overwrites `server._flow_client` with a NEW instance — and the middleware's `set_user_token()` call targets the OLD instance.
 
-#### `yertle-mcp/config.py` (modify)
+**Solution:** The lifespan is a no-op in Lambda mode:
 
-- Detect Lambda environment via `AWS_LAMBDA_FUNCTION_NAME` env var
-- In Lambda mode: read `FLOW_API_URL`, `COGNITO_*` from env vars
-- In local mode: keep existing behavior (email/password from env vars)
-
-#### `yertle-mcp/flow_client.py` (modify)
-
-Key change: in production, the MCP server should **not** authenticate with its own credentials. Instead:
-- Accept the user's Bearer token from the incoming MCP request
-- Pass it through as `Authorization: Bearer <token>` when calling the Flow API
-- Remove the `_sign_in()` / `_refresh()` logic for production mode (the user's token is already validated by API Gateway)
-
-This means each MCP user operates as themselves — their org memberships, permissions, and audit trail are preserved.
-
-#### `yertle-mcp/requirements.txt` (new)
-
-```
-mcp
-httpx
-mangum
-python-jose[cryptography]
+```python
+@asynccontextmanager
+async def lifespan(server: FastMCP):
+    if is_lambda():
+        yield
+        return
+    # local mode: create Config + FlowClient as before
+    ...
 ```
 
-### Step 5: Build Hook
+### Problem 3: Stateless HTTP Mode
 
-**File: `yertle/deployment/hooks/backend/build-mcp-package.sh`** (new)
+MCP clients send `initialize`, `tools/list`, and `tools/call` as separate HTTP requests. FastMCP's default session mode expects these to be part of the same session, but Lambda processes each request independently.
 
-Follow the same pattern as `build-versioned-package.sh`:
-1. Get version from `$VERSION` or `git describe`
-2. Create build dir, pip install from `requirements.txt`
-3. Copy `yertle-mcp/` source files (not the `docs/` directory)
-4. Zip and upload to `s3://{bucket}/lambda/{slot}/{version}/mcp.zip`
+**Solution:** Enable `stateless_http=True` in Lambda mode:
 
-**Note:** The build script needs access to the `yertle-mcp/` directory. Since the deployment pipeline runs from the `yertle/` repo root, the script will need to reference `../yertle-mcp/` or accept the MCP source path as a parameter.
-
-### Step 6: Pipeline Integration
-
-**File: `yertle/deployment/dev.yaml`** (modify)
-
-Add to backend pipeline:
-```yaml
-pipelines:
-  deploy:
-    backend:
-      - id: deploy-backend
-        description: Deploy backend lambdas + API Gateway
-        steps:
-          - hooks.check_alembic_version
-          - hooks.build_lambda_package
-          - hooks.build_mcp_package          # NEW
-          - cloudformations.backend.lambda
-          - cloudformations.backend.mcp_lambda  # NEW
-          - cloudformations.backend.apigateway   # Updated (has new MCP params)
+```python
+server = FastMCP(
+    "yertle",
+    stateless_http=True if is_lambda() else False,
+    ...
+)
 ```
 
-Add CloudFormation config:
-```yaml
-cloudformations:
-  backend:
-    mcp_lambda:
-      template: deployment/infrastructure/backend/mcp-lambda.yml
-      stack_name: "{env}-yertle-mcp-{slot}"
-      description: CFT for MCP Lambda
-      parameters:
-        Environment: *env
-        Slot: *slot
-        StackName: "{env}-yertle-mcp-{slot}"
-        Version: "{version}"
-        FlowApiUrl: "https://api-{slot}-{env}.{domain}"
-      dynamic_parameters:
-        CognitoUserPoolId:
-          command: "aws cloudformation describe-stacks --stack-name {env}-yertle-backend-cognito --region {region} --query 'Stacks[0].Outputs[?OutputKey==`UserPoolId`].OutputValue' --output text"
-        OAuthClientId:
-          command: "aws cloudformation describe-stacks --stack-name {env}-yertle-backend-cognito --region {region} --query 'Stacks[0].Outputs[?OutputKey==`OAuthUserPoolClientId`].OutputValue' --output text"
+### Problem 4: DNS Rebinding Protection
+
+FastMCP's default transport security only allows `localhost` hosts. Lambda receives requests from the API Gateway domain.
+
+**Solution:** Disable DNS rebinding protection in Lambda mode:
+
+```python
+_transport_security = (
+    TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    if is_lambda()
+    else None
+)
 ```
 
-Add hook config:
-```yaml
-hooks:
-  build_mcp_package:
-    script: deployment/hooks/backend/build-mcp-package.sh
-    description: Build MCP Lambda Package
-    parameters:
-      environment: *env
-      deployment_bucket: *shared_s3_bucket_name
-      mcp_source_dir: ../yertle-mcp
-      slot: *slot
+### Problem 5: API Gateway Stage Prefix
+
+API Gateway v2 with a custom domain includes the stage name in the path (e.g., `/dev/mcp`). FastMCP registers its route at `/mcp` (exact match). The middleware uses `.endswith()` for its own routes, but FastMCP's Starlette router does exact matching.
+
+**Solution:** Configure Mangum to strip the stage prefix:
+
+```python
+stage = os.environ.get("ENVIRONMENT", "dev")
+mangum = Mangum(app, lifespan="auto", api_gateway_base_path=f"/{stage}")
 ```
 
-Update `apigateway` config to include new dynamic parameters:
-```yaml
-    apigateway:
-      # ... existing config ...
-      dynamic_parameters:
-        # ... existing params ...
-        MCPLambdaArn:
-          command: "aws cloudformation describe-stacks --stack-name {env}-yertle-mcp-{slot} --region {region} --query 'Stacks[0].Outputs[?OutputKey==`MCPLambdaArn`].OutputValue' --output text"
-        OAuthUserPoolClientId:
-          command: "aws cloudformation describe-stacks --stack-name {env}-yertle-backend-cognito --region {region} --query 'Stacks[0].Outputs[?OutputKey==`OAuthUserPoolClientId`].OutputValue' --output text"
+### Problem 6: Python Version Mismatch in Build
+
+`pip install` on macOS downloads macOS wheels. Lambda runs Amazon Linux. Additionally, the local Python version (3.12) differs from the Lambda runtime (3.13), so pip downloads the wrong platform's compiled extensions (e.g., `pydantic_core`).
+
+**Solution:** The consolidated build script passes `--platform` and `--python-version`:
+
+```bash
+pip install --target ${BUILD_DIR} -r ${REQUIREMENTS_FILE} \
+    --platform manylinux2014_x86_64 --python-version ${PYTHON_VERSION} \
+    --only-binary=:all: --quiet
 ```
 
-## Open Questions
+## Complete File List
 
-1. **ACM Certificate:** Does the existing cert (`a08108a5-...`) cover `auth.albertcmiller.com`? If not, we need a new cert or a wildcard cert. Cognito custom domains require the cert to be in us-east-1.
+### yertle-mcp (MCP server code)
 
-2. **Cross-repo build:** The build hook runs from `yertle/` but needs `yertle-mcp/` source. Using `../yertle-mcp/` works locally but may not in CI. Alternative: copy MCP source into the yertle repo's build context, or accept the sibling path as a parameter.
+| File | Purpose |
+|------|---------|
+| `lambda_handler.py` | Lambda entry point. Resets session manager, creates fresh ASGI app per invocation, wraps with Mangum. |
+| `app.py` | FastMCP server setup, lifespan, `TokenPassthroughMiddleware` (OAuth metadata, DCR, token validation, 401 handling). |
+| `auth.py` | Cognito JWT validation (RS256 via JWKS). Caches keys at module level across warm invocations. |
+| `config.py` | Environment config. Detects Lambda mode via `AWS_LAMBDA_FUNCTION_NAME`. |
+| `flow_client.py` | HTTP client for Flow API. In Lambda mode, token set per-request via `set_user_token()`. |
+| `requirements.txt` | `mcp`, `httpx`, `mangum`, `python-jose[cryptography]` |
+| `tools/org.py` | `list_organizations` and `create_organization` tools |
+| `tools/node.py` | `create_node`, `push_node_state`, `delete_node`, `search_nodes`, `create_branch`, `list_branches` tools |
+| `resources/orgs.py` | `flow://orgs` resource |
+| `resources/nodes.py` | `flow://orgs/{org_id}/nodes`, `.../complete`, `.../canvas` resources |
 
-3. **Claude Desktop callback URLs:** The current plan includes `https://claude.ai/api/mcp/auth_callback` and `http://localhost:9876/callback` (for CLI). Claude Desktop may use a different callback URL — we may need to add it to the OAuth client once we test.
+### yertle (deployment infrastructure)
 
-4. **`.well-known` route priority:** Verify that API Gateway v2 routes `GET /.well-known/oauth-protected-resource` (specific, no auth) before the catch-all `ANY /{proxy+}` (auth required). API Gateway v2 should prefer the more specific route, but this needs testing.
+| File | Purpose |
+|------|---------|
+| `deployment/infrastructure/shared/cognito.yml` | Cognito User Pool + `UserPoolDomain` (custom domain) + `OAuthUserPoolClient` (shared OAuth client) |
+| `deployment/infrastructure/backend/mcp-lambda.yml` | MCP Lambda function (Python 3.13, 256MB, 30s timeout) |
+| `deployment/infrastructure/backend/api-core.yml` | API Gateway with MCP routes, two JWT authorizers (frontend + OAuth), MCP Lambda integration |
+| `deployment/hooks/backend/build-versioned-package.sh` | Consolidated build script for both backend and MCP Lambda packages. Handles platform targeting. |
+| `deployment/dev.yaml` | Pipeline config with `build_mcp_package` hook, `mcp_lambda` CFT, and updated `apigateway` params |
 
-## Verification Plan
+## API Gateway Routes (Complete)
 
-1. **Deploy shared stack** — verify Cognito hosted UI at `https://auth.albertcmiller.com`
-2. **Deploy backend stack** — verify MCP Lambda + new routes created
-3. **Test OAuth discovery:**
-   ```bash
-   curl https://api-blue-dev.albertcmiller.com/.well-known/oauth-protected-resource
-   ```
-4. **Test Cognito login:** Open `https://auth.albertcmiller.com/login?client_id=...&response_type=code&scope=openid+profile+email&redirect_uri=...` in browser
-5. **Test MCP integration:** Configure Claude Desktop with remote URL, verify OAuth prompt and tool calls
-6. **Regression check:** Verify frontend and CLI auth still work (existing Cognito client unchanged)
+| Route | Target | Auth | Purpose |
+|-------|--------|------|---------|
+| `GET /health` | Backend Lambda | NONE | Health check |
+| `POST /contact-messages` | Backend Lambda | NONE | Contact form |
+| `POST /auth/signin` | Backend Lambda | NONE | Email/password → JWT |
+| `POST /auth/refresh` | Backend Lambda | NONE | Refresh token |
+| `OPTIONS /{proxy+}` | Backend Lambda | NONE | CORS preflight |
+| `ANY /{proxy+}` | Backend Lambda | CognitoAuthorizer | All other backend API calls |
+| `POST /mcp` | MCP Lambda | NONE* | MCP JSON-RPC (auth handled by Lambda) |
+| `GET /mcp` | MCP Lambda | NONE* | MCP SSE |
+| `GET /.well-known/oauth-protected-resource` | MCP Lambda | NONE | Protected resource metadata |
+| `GET /.well-known/oauth-authorization-server` | MCP Lambda | NONE | Authorization server metadata |
+| `POST /register` | MCP Lambda | NONE | Dynamic client registration |
+
+*MCP routes have `AuthorizationType: NONE` on API Gateway. The MCP Lambda handles auth itself so it can return proper `WWW-Authenticate` headers per the MCP spec.
+
+## Lambda Environment Variables
+
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `ENVIRONMENT` | `dev` / `prod` | Environment name (used as API Gateway stage prefix) |
+| `FLOW_API_URL` | `https://api-{slot}-{env}.{domain}` | Backend API URL for proxied tool calls |
+| `COGNITO_REGION` | `us-east-1` | Cognito region for JWKS URL construction |
+| `COGNITO_USER_POOL_ID` | From Cognito stack output | User Pool ID for issuer validation |
+| `COGNITO_APP_CLIENT_ID` | From Cognito stack output (`OAuthUserPoolClientId`) | Returned by DCR endpoint |
+| `COGNITO_DOMAIN` | `https://auth.{domain}` | Cognito hosted UI domain for OAuth metadata |
+
+## Verification
+
+```bash
+# 1. OAuth metadata
+curl https://api-blue-dev.albertcmiller.com/.well-known/oauth-protected-resource
+curl https://api-blue-dev.albertcmiller.com/.well-known/oauth-authorization-server
+
+# 2. Dynamic client registration (should return pre-registered client_id)
+curl -X POST https://api-blue-dev.albertcmiller.com/register \
+  -H "Content-Type: application/json" \
+  -d '{"client_name":"test","redirect_uris":["https://example.com/callback"]}'
+
+# 3. MCP endpoint (should return 401 with WWW-Authenticate)
+curl -X POST https://api-blue-dev.albertcmiller.com/mcp
+
+# 4. MCP with token (should return tool results)
+TOKEN=$(curl -s -X POST https://api-blue-dev.albertcmiller.com/auth/signin \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"Test123!"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['accessToken'])")
+
+curl -X POST https://api-blue-dev.albertcmiller.com/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"list_organizations","arguments":{}},"id":1}'
+
+# 5. claude.ai: Settings > Connectors > Add custom connector
+#    Name: Yertle Dev
+#    URL: https://api-blue-dev.albertcmiller.com/mcp
+```
 
 ## Future: CLI Browser-Based Login
 
-The OAuth infrastructure built here (Cognito hosted UI, `OAuthUserPoolClient`) is designed to be reused by `yertle-cli` for browser-based login, replacing the current email/password prompt. The flow:
+The OAuth infrastructure (Cognito hosted UI, `OAuthUserPoolClient`) is designed to be reused by `yertle-cli` for browser-based login. See `yertle-cli/docs/OAUTH_BROWSER_LOGIN.md`.
 
-1. `yertle auth login` opens the user's browser to the Cognito hosted UI
-2. CLI starts a temporary localhost HTTP server (`http://localhost:9876/callback`)
-3. User logs in via Cognito in the browser
-4. Cognito redirects to localhost with auth code
-5. CLI exchanges code for tokens (PKCE) and stores in `~/.yertle/config.json`
-
-This is already supported by the `OAuthUserPoolClient` — the localhost callback URL is included. The only work needed is on the `yertle-cli` side (`cmd/auth.go`), no infrastructure changes required.
-
-Benefits: no passwords in terminals, MFA-ready, SSO-ready (if identity providers are added to Cognito later).
+The `OAuthUserPoolClient` already has `http://localhost:9876/callback` in its callback URLs. Only CLI-side Go code changes needed.
 
 ## Future: Other Considerations
 
-- **Provisioned concurrency:** If cold starts (1-3s) are noticeable, add provisioned concurrency ($11/month) or a CloudWatch ping schedule
-- **Custom scopes:** Add `yertle:read`, `yertle:write` OAuth scopes for fine-grained permissions
-- **Deployment pipeline evolution:** Consider moving to a per-repo pipeline or CDK when complexity warrants it
+- **Provisioned concurrency:** Cold starts are 1.5-2s. Add provisioned concurrency ($11/month) or CloudWatch ping schedule if noticeable.
+- **Custom scopes:** Add `yertle:read`, `yertle:write` OAuth scopes for fine-grained permissions.
+- **Per-user audit trail:** Currently all MCP users share one Cognito app client. Audit logs show the user's `sub` (Cognito user ID) but the same `client_id`. If per-client tracking is needed, consider Client ID Metadata Documents (CIMD) per the Nov 2025 MCP spec.
+- **Resources in claude.ai:** claude.ai connectors only support tools, not MCP resources. The `list_organizations` tool was added as a workaround. Other resources may need tool equivalents.
+- **Debug logging:** Lambda logging goes to CloudWatch. The `logging` module writes to stderr (for stdio transport compatibility). Use `print()` for Lambda-visible logs during debugging.
