@@ -93,12 +93,3 @@ def validate_token_sync(token: str) -> dict:
         raise RuntimeError(f"Token validation failed: {e}")
 
 
-def oauth_metadata(resource_url: str, cognito_domain: str) -> dict:
-    """Return the OAuth Protected Resource metadata document.
-
-    Served at GET /.well-known/oauth-protected-resource per RFC 9470.
-    """
-    return {
-        "resource": resource_url,
-        "authorization_servers": [cognito_domain],
-    }
