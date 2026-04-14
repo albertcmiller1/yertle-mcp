@@ -229,6 +229,34 @@ pip install --target ${BUILD_DIR} -r ${REQUIREMENTS_FILE} \
     --only-binary=:all: --quiet
 ```
 
+### Problem 7: Access Tokens Missing Email Claim (Backend Fix)
+
+Cognito access tokens have `sub` (user ID) but no `email` claim — only ID tokens include `email`. The frontend sends the ID token, but MCP passes the access token through. Backend routes that depend on `get_current_user_email()` (like `POST /orgs`, pull requests) fail with 500 because the email claim is missing.
+
+**Solution:** Updated `get_current_user_email()` in `yertle/backend/src/api/dependencies.py` with a three-tier fallback:
+
+1. Check token claims for `email` (ID tokens have it) → return if found
+2. Look up from `organization_memberships` via `OrganizationRepository.get_user_emails_by_ids()` → return if found
+3. Call `boto3 cognito-idp AdminGetUser` to get the email from Cognito user attributes → return if found (cached in-memory across warm invocations)
+4. Fall back to `sub` as last resort
+
+This required adding `cognito-idp:AdminGetUser` IAM permission to the backend Lambda role (`lambda-supabase.yml`) and a `CognitoUserPoolArn` dynamic parameter in `dev.yaml`/`prod.yaml`.
+
+### Problem 8: user_email is None in Lambda Mode
+
+`tools/node.py` calls `_config().user_email.split("@")` to generate default directory paths. In Lambda mode, `user_email` is `None` (no credentials configured), causing `AttributeError: 'NoneType' object has no attribute 'split'`.
+
+**Solution:** Guard the `.split()` call:
+
+```python
+user_email = _config().user_email
+if user_email:
+    username = user_email.split("@")[0]
+    default_dirs = [f"/users/{username}"]
+else:
+    default_dirs = []
+```
+
 ## Complete File List
 
 ### yertle-mcp (MCP server code)
@@ -255,6 +283,8 @@ pip install --target ${BUILD_DIR} -r ${REQUIREMENTS_FILE} \
 | `deployment/infrastructure/backend/api-core.yml` | API Gateway with MCP routes, two JWT authorizers (frontend + OAuth), MCP Lambda integration |
 | `deployment/hooks/backend/build-versioned-package.sh` | Consolidated build script for both backend and MCP Lambda packages. Handles platform targeting. |
 | `deployment/dev.yaml` | Pipeline config with `build_mcp_package` hook, `mcp_lambda` CFT, and updated `apigateway` params |
+| `backend/src/api/dependencies.py` | `get_current_user_email()` updated to handle access tokens (no email claim) — falls back to DB lookup then Cognito `AdminGetUser` |
+| `deployment/infrastructure/backend/lambda-supabase.yml` | Added `CognitoUserPoolArn` parameter and `cognito-idp:AdminGetUser` IAM permission for email lookup |
 
 ## API Gateway Routes (Complete)
 
