@@ -40,8 +40,12 @@ async def create_node(
     merged_tags = default_tags
 
     # Default directory — /users/<username from email>
-    username = _config().user_email.split("@")[0]
-    default_dirs = [f"/users/{username}"]
+    user_email = _config().user_email
+    if user_email:
+        username = user_email.split("@")[0]
+        default_dirs = [f"/users/{username}"]
+    else:
+        default_dirs = []
     if directories:
         # Merge: add defaults that aren't already present
         merged_dirs = list(directories)

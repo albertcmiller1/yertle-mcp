@@ -159,4 +159,4 @@ If the endpoint returns backend-native state that is hard for an LLM to use, add
 - Errors are normalized in `FlowClient._handle_response()` into readable runtime exceptions.
 - Auth retry is centralized in `FlowClient._with_retry()`, so individual API wrappers stay simple.
 
-For a deeper walkthrough of the request flow and module boundaries, see [`ARCHITECTURE.md`](./ARCHITECTURE.md).
+For a deeper walkthrough of the request flow and module boundaries, see [`ARCHITECTURE.md`](./docs/ARCHITECTURE.md).

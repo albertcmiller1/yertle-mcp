@@ -1,31 +1,53 @@
-"""Environment-based configuration for the Flow MCP server."""
+"""Environment-based configuration for the Flow MCP server.
+
+Supports two modes:
+  - Local (stdio): reads FLOW_USER_EMAIL / FLOW_USER_PASSWORD for auth
+  - Lambda (production): user authenticates via OAuth; no credentials needed here
+"""
 
 import os
+
+
+def is_lambda() -> bool:
+    """Return True if running inside AWS Lambda."""
+    return "AWS_LAMBDA_FUNCTION_NAME" in os.environ
 
 
 class Config:
     """Reads configuration from environment variables.
 
-    Required env vars:
+    Local mode env vars:
         FLOW_API_URL        — Base URL of the Flow backend (default: http://localhost:8000)
         FLOW_USER_EMAIL     — Email for local auth sign-in
         FLOW_USER_PASSWORD  — Password for local auth sign-in
+        FLOW_DEFAULT_ORG_ID — Default org UUID (optional)
 
-    Optional env vars:
-        FLOW_DEFAULT_ORG_ID — Default org UUID (avoids passing org_id on every tool call)
+    Lambda mode env vars:
+        FLOW_API_URL        — Backend API URL (e.g. https://api.yertle.com)
+        COGNITO_REGION      — AWS region for Cognito
+        COGNITO_USER_POOL_ID    — Cognito User Pool ID
+        COGNITO_APP_CLIENT_ID   — OAuth app client ID
+        FLOW_DEFAULT_ORG_ID     — Default org UUID (optional)
     """
 
     def __init__(self):
         self._api_url = os.environ.get("FLOW_API_URL", "http://localhost:8000")
         self._default_org_id = os.environ.get("FLOW_DEFAULT_ORG_ID")
+        self._is_lambda = is_lambda()
 
-        self._user_email = os.environ.get("FLOW_USER_EMAIL")
-        if not self._user_email:
-            raise RuntimeError("FLOW_USER_EMAIL environment variable is required")
+        if self._is_lambda:
+            # In Lambda mode, user tokens are set per-request via OAuth.
+            # No email/password needed.
+            self._user_email = None
+            self._user_password = None
+        else:
+            self._user_email = os.environ.get("FLOW_USER_EMAIL")
+            if not self._user_email:
+                raise RuntimeError("FLOW_USER_EMAIL environment variable is required")
 
-        self._user_password = os.environ.get("FLOW_USER_PASSWORD")
-        if not self._user_password:
-            raise RuntimeError("FLOW_USER_PASSWORD environment variable is required")
+            self._user_password = os.environ.get("FLOW_USER_PASSWORD")
+            if not self._user_password:
+                raise RuntimeError("FLOW_USER_PASSWORD environment variable is required")
 
     @property
     def api_url(self) -> str:
@@ -33,13 +55,18 @@ class Config:
         return self._api_url
 
     @property
-    def user_email(self) -> str:
-        """Email address used to sign in to the Flow backend."""
+    def is_lambda(self) -> bool:
+        """True if running inside AWS Lambda."""
+        return self._is_lambda
+
+    @property
+    def user_email(self) -> str | None:
+        """Email address used to sign in (local mode only)."""
         return self._user_email
 
     @property
-    def user_password(self) -> str:
-        """Password used to sign in to the Flow backend."""
+    def user_password(self) -> str | None:
+        """Password used to sign in (local mode only)."""
         return self._user_password
 
     @property

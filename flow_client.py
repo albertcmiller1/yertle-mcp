@@ -3,6 +3,10 @@
 This is the main client class that orchestrates auth, API calls,
 response transformation, and push logic. The heavy lifting is
 delegated to api.py, transform.py, and push.py.
+
+Supports two auth modes:
+  - Local: signs in with email/password, manages token refresh
+  - Lambda: passes through the user's OAuth Bearer token
 """
 
 import json
@@ -19,11 +23,17 @@ logger = logging.getLogger("yertle")
 class FlowClient:
     """Async HTTP client for the Flow REST API.
 
-    Usage:
+    Usage (local mode):
         client = FlowClient(config)
         await client.connect()       # signs in + creates httpx client
         nodes = await client.list_nodes(org_id)
         await client.close()
+
+    Usage (Lambda mode):
+        client = FlowClient(config)
+        await client.connect()       # creates httpx client only (no sign-in)
+        client.set_user_token(token)  # set per-request OAuth token
+        nodes = await client.list_nodes(org_id)
     """
 
     def __init__(self, config: Config):
@@ -34,12 +44,17 @@ class FlowClient:
         self._refresh_token: str | None = None
 
     async def connect(self):
-        """Create the httpx.AsyncClient and sign in to get JWT tokens."""
+        """Create the httpx.AsyncClient and optionally sign in.
+
+        In local mode, signs in with email/password to get tokens.
+        In Lambda mode, tokens are set per-request via set_user_token().
+        """
         self._client = httpx.AsyncClient(
             base_url=self._config.api_url,
             timeout=30.0,
         )
-        await self._sign_in()
+        if not self._config.is_lambda:
+            await self._sign_in()
 
     async def close(self):
         """Close the underlying httpx client."""
@@ -50,6 +65,15 @@ class FlowClient:
     # ------------------------------------------------------------------ #
     # Auth
     # ------------------------------------------------------------------ #
+
+    def set_user_token(self, token: str) -> None:
+        """Set the user's OAuth Bearer token for pass-through (Lambda mode).
+
+        In production, the MCP server receives a pre-validated JWT from
+        API Gateway and passes it through to the Flow API. Each user
+        operates as themselves.
+        """
+        self._access_token = token
 
     async def _sign_in(self) -> None:
         """POST /auth/signin with email + password. Stores access + refresh tokens."""
@@ -94,9 +118,13 @@ class FlowClient:
         return {"Authorization": f"Bearer {self._access_token}"}
 
     async def _with_retry(self, api_call, *args, **kwargs):
-        """Call an api function with auto-retry on 401 (expired token)."""
+        """Call an api function with auto-retry on 401 (expired token).
+
+        In Lambda mode, skip retry — the token is managed by the OAuth client,
+        not by us. A 401 means the user's token is invalid.
+        """
         resp = await api_call(self._client, self._headers(), *args, **kwargs)
-        if resp.status_code == 401:
+        if resp.status_code == 401 and not self._config.is_lambda:
             logger.info("Got 401, refreshing token and retrying")
             await self._refresh()
             resp = await api_call(self._client, self._headers(), *args, **kwargs)
@@ -208,7 +236,7 @@ class FlowClient:
         if status == 401:
             raise RuntimeError(
                 f"Authentication failed: {detail}. "
-                "Check FLOW_USER_EMAIL and FLOW_USER_PASSWORD."
+                "Check your credentials or OAuth token."
             )
         elif status == 404:
             raise RuntimeError(f"Not found: {detail}. Check the ID you provided.")
