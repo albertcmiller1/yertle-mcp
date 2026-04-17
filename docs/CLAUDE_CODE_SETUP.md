@@ -3,7 +3,7 @@
 ## Current Setup Command
 
 ```bash
-claude mcp add --transport http --callback-port 9876 yertle-dev https://api-blue-dev.albertcmiller.com/mcp
+claude mcp add --transport http --callback-port 9876 yertle-dev https://api.dev.yertle.com/mcp
 ```
 
 This adds the remote Yertle MCP server to Claude Code. On first use, it opens a browser for Cognito login. After authenticating, tools like `list_organizations`, `create_node`, and `push_node_state` are available in the conversation.

@@ -207,7 +207,7 @@ class TokenPassthroughMiddleware:
             cognito_region = os.environ.get("COGNITO_REGION", "us-east-1")
             cognito_user_pool_id = os.environ.get("COGNITO_USER_POOL_ID", "")
             # Fetch from Cognito OIDC discovery on first call
-            cognito_domain = f"https://auth.{os.environ.get('DOMAIN', 'albertcmiller.com')}"
+            cognito_domain = f"https://auth.{os.environ.get('DOMAIN', 'yertle.com')}"
 
         metadata = {
             "issuer": flow_api_url,

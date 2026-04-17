@@ -14,7 +14,7 @@ The MCP server runs as an AWS Lambda function behind the existing API Gateway, a
 |----------|--------|-----|
 | Auth method | OAuth 2.1 + PKCE (authorization code flow) | MCP spec standard; natively supported by Claude clients |
 | OAuth client naming | Generic `OAuth*` (not `MCP*`) | Same Cognito client reused by CLI browser login (future) |
-| Cognito domain | Custom domain (`auth.albertcmiller.com` / `auth.yertle.com`) | Professional, branded login experience |
+| Cognito domain | Custom domain (`auth.dev.yertle.com` / `auth.yertle.com`) | Professional, branded login experience |
 | API Gateway | Routes on existing backend API Gateway | Reuses infrastructure; avoids managing a separate gateway |
 | Deployment | Bundled into existing `yertle/deployment/` pipeline | Pipeline is battle-tested; cross-stack dependencies already wired |
 | User identity | Pass through user's OAuth token to Flow API | Each MCP user acts as themselves, not a shared service account |
@@ -30,7 +30,7 @@ Claude Desktop / claude.ai / Claude Code
         │  2. GET /.well-known/oauth-protected-resource → our server as auth server
         │  3. GET /.well-known/oauth-authorization-server → Cognito endpoints + DCR
         │  4. POST /register → returns pre-registered OAuthUserPoolClient ID
-        │  5. Browser → auth.albertcmiller.com (Cognito hosted UI) → user logs in
+        │  5. Browser → auth.dev.yertle.com (Cognito hosted UI) → user logs in
         │  6. Cognito redirects to callback with auth code
         │  7. Client exchanges code for tokens (PKCE, directly with Cognito)
         │  8. POST /mcp + Bearer token → MCP tool calls work
@@ -319,24 +319,24 @@ else:
 
 ```bash
 # 1. OAuth metadata
-curl https://api-blue-dev.albertcmiller.com/.well-known/oauth-protected-resource
-curl https://api-blue-dev.albertcmiller.com/.well-known/oauth-authorization-server
+curl https://api.dev.yertle.com/.well-known/oauth-protected-resource
+curl https://api.dev.yertle.com/.well-known/oauth-authorization-server
 
 # 2. Dynamic client registration (should return pre-registered client_id)
-curl -X POST https://api-blue-dev.albertcmiller.com/register \
+curl -X POST https://api.dev.yertle.com/register \
   -H "Content-Type: application/json" \
   -d '{"client_name":"test","redirect_uris":["https://example.com/callback"]}'
 
 # 3. MCP endpoint (should return 401 with WWW-Authenticate)
-curl -X POST https://api-blue-dev.albertcmiller.com/mcp
+curl -X POST https://api.dev.yertle.com/mcp
 
 # 4. MCP with token (should return tool results)
-TOKEN=$(curl -s -X POST https://api-blue-dev.albertcmiller.com/auth/signin \
+TOKEN=$(curl -s -X POST https://api.dev.yertle.com/auth/signin \
   -H "Content-Type: application/json" \
   -d '{"email":"admin@example.com","password":"Test123!"}' \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['accessToken'])")
 
-curl -X POST https://api-blue-dev.albertcmiller.com/mcp \
+curl -X POST https://api.dev.yertle.com/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "Authorization: Bearer $TOKEN" \
@@ -344,7 +344,7 @@ curl -X POST https://api-blue-dev.albertcmiller.com/mcp \
 
 # 5. claude.ai: Settings > Connectors > Add custom connector
 #    Name: Yertle Dev
-#    URL: https://api-blue-dev.albertcmiller.com/mcp
+#    URL: https://api.dev.yertle.com/mcp
 ```
 
 ## Future: CLI Browser-Based Login

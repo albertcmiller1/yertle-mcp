@@ -23,7 +23,7 @@ class Config:
         FLOW_DEFAULT_ORG_ID — Default org UUID (optional)
 
     Lambda mode env vars:
-        FLOW_API_URL        — Backend API URL (e.g. https://api-blue-dev.albertcmiller.com)
+        FLOW_API_URL        — Backend API URL (e.g. https://api.yertle.com)
         COGNITO_REGION      — AWS region for Cognito
         COGNITO_USER_POOL_ID    — Cognito User Pool ID
         COGNITO_APP_CLIENT_ID   — OAuth app client ID
